@@ -845,20 +845,61 @@ async function checkConnection() {
   state.llmUrl = document.getElementById('llm-url').value.replace(/\/$/, '');
   state.model = document.getElementById('model-name').value.trim();
 
-  try {
-    const resp = await fetch(`${state.llmUrl}/api/tags`, { signal: AbortSignal.timeout(6000) });
-    if (resp.ok) {
-      const data = await resp.json();
-      const models = (data.models || []).map(m => m.name);
-      
-      if (models.length === 0) {
-        dot.className = 'status-dot error';
-        txt.textContent = 'connected but no models installed';
-        state.connected = false;
+  // Try multiple endpoint strategies in case of CORS or path issues
+  const urlsToTry = [
+    { url: `${state.llmUrl}/api/tags`, label: '/api/tags' },
+    { url: `${state.llmUrl}/v1/models`, label: '/v1/models' },
+    { url: `${state.llmUrl}/status`, label: '/status' },
+  ];
+
+  let lastError = '';
+  let debugLog = [];
+
+  for (const { url, label } of urlsToTry) {
+    try {
+      debugLog.push(`trying ${label}...`);
+      const resp = await fetch(url, {
+        signal: AbortSignal.timeout(6000),
+        headers: { 'Accept': 'application/json' }
+      });
+
+      debugLog.push(`${label} → ${resp.status}`);
+
+      if (!resp.ok) {
+        lastError = `${label} returned ${resp.status}`;
+        continue;
+      }
+
+      const raw = await resp.text();
+      debugLog.push(`body: ${raw.slice(0, 100)}`);
+
+      let data;
+      try { data = JSON.parse(raw); } catch(e) {
+        lastError = `${label} non-JSON response`;
+        continue;
+      }
+
+      // Extract models from either /api/tags or /v1/models format
+      let models = [];
+      if (data.models) models = data.models.map(m => m.name || m.id || m);
+      else if (data.data) models = data.data.map(m => m.id || m.name || m);
+      else if (data.status) {
+        // /status endpoint — server is alive but can't get models this way
+        dot.className = 'status-dot online';
+        txt.textContent = `server alive (via ${label}) — enter model name manually`;
+        state.connected = true;
+        showDebug(debugLog);
         return;
       }
 
-      // Show available models in the model input as a datalist
+      if (models.length === 0) {
+        dot.className = 'status-dot error';
+        txt.textContent = 'connected but no models found — install one in ai.local first';
+        showDebug(debugLog);
+        return;
+      }
+
+      // Populate datalist for autocomplete
       let datalist = document.getElementById('model-datalist');
       if (!datalist) {
         datalist = document.createElement('datalist');
@@ -874,37 +915,55 @@ async function checkConnection() {
 
       if (exactMatch) {
         dot.className = 'status-dot online';
-        txt.textContent = 'connected ✓';
+        txt.textContent = `connected ✓ — ${models.length} model(s) available`;
         state.connected = true;
       } else if (partialMatch) {
-        // Auto-correct model name to exact name
         document.getElementById('model-name').value = partialMatch;
         state.model = partialMatch;
         dot.className = 'status-dot online';
-        txt.textContent = `using: ${partialMatch}`;
+        txt.textContent = `auto-selected: ${partialMatch}`;
         state.connected = true;
-      } else if (!modelInput) {
-        // Use first available model
+      } else {
+        // Auto-select first model if field is empty or wrong
         document.getElementById('model-name').value = models[0];
         state.model = models[0];
         dot.className = 'status-dot online';
-        txt.textContent = `auto-selected: ${models[0]}`;
+        txt.textContent = `using: ${models[0]}`;
         state.connected = true;
-      } else {
-        dot.className = 'status-dot error';
-        txt.textContent = `not found — tap field to pick from ${models.length} model(s)`;
-        state.connected = false;
-        // Still pre-fill with first model as hint
-        document.getElementById('model-name').placeholder = models[0];
       }
-    } else {
-      throw new Error('bad response');
+
+      showDebug(debugLog);
+      return; // success — stop trying
+
+    } catch(e) {
+      lastError = `${label} failed: ${e.message}`;
+      debugLog.push(lastError);
     }
-  } catch(e) {
-    dot.className = 'status-dot error';
-    txt.textContent = 'cannot reach server — check URL & that ai.local is running';
-    state.connected = false;
   }
+
+  // All endpoints failed
+  dot.className = 'status-dot error';
+  txt.textContent = `unreachable — see debug below`;
+  state.connected = false;
+  showDebug(debugLog, true);
+}
+
+function showDebug(lines, isError = false) {
+  let el = document.getElementById('debug-box');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'debug-box';
+    el.style.cssText = `
+      margin-top: 0.5rem; padding: 0.6rem 0.75rem;
+      background: rgba(0,0,0,0.4); border: 1px solid rgba(201,151,58,0.2);
+      border-radius: 8px; font-family: 'JetBrains Mono', monospace;
+      font-size: 0.6rem; color: #9e8e78; line-height: 1.6;
+      white-space: pre-wrap; word-break: break-all;
+    `;
+    document.querySelector('.settings-card').appendChild(el);
+  }
+  el.style.borderColor = isError ? 'rgba(244,67,54,0.3)' : 'rgba(201,151,58,0.2)';
+  el.textContent = lines.join('\n');
 }
 
 // ===== LLM CALLS =====
