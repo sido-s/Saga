@@ -698,7 +698,7 @@ h1.logo { font-size: 2.2rem; }
     </div>
   </div>
   <div class="setting-row">
-    <div class="setting-label">Streaming <span>Show text as it's generated</span></div>
+    <div class="setting-label">Typewriter effect <span>Reveals text word-by-word (ai.local doesn't stream)</span></div>
     <label class="toggle">
       <input type="checkbox" id="streaming-toggle" checked>
       <span class="toggle-slider"></span>
@@ -846,36 +846,74 @@ async function checkConnection() {
   state.model = document.getElementById('model-name').value.trim();
 
   try {
-    const resp = await fetch(`${state.llmUrl}/api/tags`, { signal: AbortSignal.timeout(4000) });
+    const resp = await fetch(`${state.llmUrl}/api/tags`, { signal: AbortSignal.timeout(6000) });
     if (resp.ok) {
       const data = await resp.json();
       const models = (data.models || []).map(m => m.name);
-      const modelExists = models.some(m => m.startsWith(state.model));
-      if (modelExists || models.length === 0) {
+      
+      if (models.length === 0) {
+        dot.className = 'status-dot error';
+        txt.textContent = 'connected but no models installed';
+        state.connected = false;
+        return;
+      }
+
+      // Show available models in the model input as a datalist
+      let datalist = document.getElementById('model-datalist');
+      if (!datalist) {
+        datalist = document.createElement('datalist');
+        datalist.id = 'model-datalist';
+        document.body.appendChild(datalist);
+        document.getElementById('model-name').setAttribute('list', 'model-datalist');
+      }
+      datalist.innerHTML = models.map(m => `<option value="${m}">`).join('');
+
+      const modelInput = document.getElementById('model-name').value.trim();
+      const exactMatch = models.find(m => m === modelInput);
+      const partialMatch = models.find(m => m.toLowerCase().includes(modelInput.toLowerCase()));
+
+      if (exactMatch) {
         dot.className = 'status-dot online';
-        txt.textContent = 'connected';
+        txt.textContent = 'connected ✓';
+        state.connected = true;
+      } else if (partialMatch) {
+        // Auto-correct model name to exact name
+        document.getElementById('model-name').value = partialMatch;
+        state.model = partialMatch;
+        dot.className = 'status-dot online';
+        txt.textContent = `using: ${partialMatch}`;
+        state.connected = true;
+      } else if (!modelInput) {
+        // Use first available model
+        document.getElementById('model-name').value = models[0];
+        state.model = models[0];
+        dot.className = 'status-dot online';
+        txt.textContent = `auto-selected: ${models[0]}`;
         state.connected = true;
       } else {
         dot.className = 'status-dot error';
-        txt.textContent = `model not found (available: ${models.slice(0,3).join(', ')})`;
+        txt.textContent = `not found — tap field to pick from ${models.length} model(s)`;
         state.connected = false;
+        // Still pre-fill with first model as hint
+        document.getElementById('model-name').placeholder = models[0];
       }
     } else {
       throw new Error('bad response');
     }
   } catch(e) {
     dot.className = 'status-dot error';
-    txt.textContent = 'cannot reach Ollama';
+    txt.textContent = 'cannot reach server — check URL & that ai.local is running';
     state.connected = false;
   }
 }
 
 // ===== LLM CALLS =====
+// ai.local does not support streaming — responses always return complete.
+// We simulate a typewriter effect after receiving the full response.
 async function streamText(prompt, onChunk, useHistory = true) {
   const messages = [];
   
   if (useHistory && state.history.length > 0) {
-    // Build conversation context
     const ctx = state.history.map(h => 
       h.role === 'narrator' ? `[NARRATOR]: ${h.text}` : `[PLAYER]: ${h.text}`
     ).join('\n\n');
@@ -884,45 +922,41 @@ async function streamText(prompt, onChunk, useHistory = true) {
     messages.push({ role: 'user', content: prompt });
   }
 
+  // ai.local: stream is ignored; only temperature works (camelCase options keys)
   const body = {
     model: state.model,
     messages,
-    stream: state.streaming && !!onChunk,
-    options: { temperature: 0.85, top_p: 0.9 }
+    stream: false,
+    options: { temperature: 0.85 }
   };
 
   const resp = await fetch(`${state.llmUrl}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(60000)
+    signal: AbortSignal.timeout(90000)  // on-device inference can be slow — allow 90s
   });
 
-  if (!resp.ok) throw new Error(`LLM error: ${resp.status}`);
-
-  if (state.streaming && onChunk) {
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let fullText = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunk = decoder.decode(value);
-      const lines = chunk.split('\n').filter(Boolean);
-      for (const line of lines) {
-        try {
-          const data = JSON.parse(line);
-          const delta = data.message?.content || '';
-          fullText += delta;
-          onChunk(delta, fullText);
-        } catch {}
-      }
-    }
-    return fullText;
-  } else {
-    const data = await resp.json();
-    return data.message?.content || '';
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => '');
+    throw new Error(`LLM error ${resp.status}${errText ? ': ' + errText.slice(0, 120) : ''}`);
   }
+
+  const data = await resp.json();
+  const text = data.message?.content || '';
+
+  // Simulate typewriter reveal since ai.local doesn't actually stream
+  if (onChunk && text) {
+    const words = text.split(' ');
+    let revealed = '';
+    for (let i = 0; i < words.length; i++) {
+      revealed += (i === 0 ? '' : ' ') + words[i];
+      onChunk(null, revealed);
+      if (i % 4 === 0) await new Promise(r => setTimeout(r, 18));
+    }
+  }
+
+  return text;
 }
 
 // ===== GAME LOGIC =====
